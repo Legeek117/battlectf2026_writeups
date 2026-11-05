@@ -17,10 +17,9 @@ Les flags restent caviardés dans les writeups de référence.
 - [PWN#002](pwn/pwn002-notes.md)
 - [PWN#003](pwn/pwn003.md)
 - [PWN#004](pwn/pwn004-pets.md)
-- [PWN#005](pwn/pwn005.md)
 - [PWN#006](pwn/pwn006-quickjs.md)
 - [PWN#007](pwn/pwn007-kernel-vault.md)
-- [PWN#Alpha / Beta](pwn/vault-alpha-beta.md)
+- [PWN#Alpha](pwn/pwn-alpha.md)
 - [PWN#Delta](pwn/pwn-delta.md)
 - [PWN#Epsilon](pwn/pwn-epsilon.md)
 - [PWN#Zeta](pwn/pwn-zeta.md)
@@ -50,16 +49,11 @@ Les flags restent caviardés dans les writeups de référence.
 - [Discord](out-context/discord.md)
 - [Know Your Enemy](out-context/know-your-enemy.md)
 
-## Notes et artifacts locaux
+## Artifacts
 
-- [OT#005 — investigation](notes/OT005_investigation.md)
-- [Artifacts PDF](artifacts/)
-- [État des writeups incomplets](INCOMPLETE.md)
+- [PDF associés](artifacts/)
 
-## Comparaison avec le dossier initial
+## Périmètre de soumission
 
-Le dossier initial contenait déjà plusieurs writeups complets, mais certains étaient regroupés dans
-`*_CTF_writeups.md`, d'autres dans des sous-dossiers, et PWN#005 était marqué non résolu. La version
-organisée fournit maintenant un fichier par challenge et ajoute les writeups ou notes qui manquaient localement,
-notamment la recon complète de PWN#005 (qui reste bloqué en black-box), OT#002/003 dans leur forme canonique,
-ainsi que VULN#003/005/006 et les challenges Web absents sous forme Markdown.
+Cette arborescence contient uniquement les writeups de challenges résolus et leurs artifacts associés.
+Les investigations incomplètes et les challenges non résolus restent hors du dépôt de soumission.
