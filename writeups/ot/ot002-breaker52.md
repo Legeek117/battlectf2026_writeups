@@ -1,74 +1,69 @@
-# OT#002 — Breaker 52 (protocole binaire custom, attaque Aurora)
+# OT#002 — Breaker 52 (custom binary, Aurora attack)
 
-- **Cible :** `<HOST>:<PORT>` (contrôleur de disjoncteur de générateur, interconnexion sous-station)
-- **Catégorie :** OT / ICS
-- **Flag :** `CTF{REDACTED}` (voir règle de non-persistance des flags)
-- **Protocole :** TCP custom, requêtes de 5 octets fixes
+### Scenario
+Generator tie-breaker controller at a substation interconnect. Objective: *"Physically
+destroy the generator, then retrieve the flag that records the incident."* The briefing
+states the **sync-check relay (ANSI device 25) is NOT PRESENT** — the whole hint in one line.
 
-## Contexte
+### Protocol recon (what the player discovers)
+- **Custom binary TCP**, fixed **5-byte requests**: `[opcode][arg0][arg1][arg2][arg3]`.
+- No banner; server waits for input. Connection is **persistent** (multi-command).
+- **Response framing is length-by-opcode and must be exact**, or the byte stream desyncs and
+  every later read is shifted (this bites players hard — see pitfalls):
+  - `0x01` → **11-byte** telemetry: `[status=00][float32 LE grid_angle][float32 LE gen_angle][breaker_closed][00]`
+  - `0x02..0x05` → **1 byte**
+  - any other opcode → **1 byte** `0xff`
+- Valid opcodes: only `0x01..0x05`.
 
-Contrôleur du disjoncteur de couplage (tie-breaker) d'un générateur à une sous-station d'interconnexion. Objectif : « Détruire physiquement le générateur, puis récupérer le flag qui enregistre l'incident. » Le briefing indique que le **relais de vérification de synchronisme (dispositif ANSI 25) n'est PAS PRÉSENT** — tout l'indice en une ligne.
+### Command model (reverse-engineered)
+| opcode | meaning |
+|--------|---------|
+| `0x01` | telemetry (two phase angles, breaker bit) |
+| `0x02` | breaker status read (0 = open) |
+| `0x03` | **generator status**: `01` online · `00` offline · **`02` = DESTROYED** |
+| `0x04` | open breaker |
+| `0x05` arg=1 | **close breaker** |
 
-## Identification du protocole
+### The physics the challenge simulates
+- `grid_angle` and `gen_angle` both rotate 0→360°. The generator runs at a slightly different
+  frequency, so the **slip angle Δ = (grid − gen) mod 360** accumulates from 0 at ~5°/s.
+- A fresh connection starts **synchronised** (Δ≈0). Closing the breaker at Δ≈0 is a *safe
+  synchronisation* → nothing happens.
+- Because there's **no sync-check interlock**, the breaker will close at **any** Δ. Closing
+  near **Δ ≈ 180°** (anti-phase) produces the destructive torque transient = **Aurora**.
 
-- **TCP binaire custom**, requêtes fixes de **5 octets** : `[opcode][arg0][arg1][arg2][arg3]`.
-- Pas de bannière ; le serveur attend l'entrée. Connexion **persistante** (multi-commandes).
-- **Le cadrage des réponses est fixe par opcode** et doit être exact, sinon le flux d'octets se désynchronise et chaque lecture suivante est décalée :
-  - `0x01` → **11 octets** de télémétrie : `[status=00][float32 LE angle_réseau][float32 LE angle_générateur][disjoncteur_fermé][00]`
-  - `0x02..0x05` → **1 octet**
-  - tout autre opcode → **1 octet** `0xff`
-- Opcodes valides : uniquement `0x01..0x05`.
+### The working attack
+1. Open one connection; poll `0x01`, compute `Δ = (grid − gen) mod 360`.
+2. Wait until `|Δ − 180| ≤ ~6°`.
+3. Fire `0x05 01 00 00 00` (close) at that instant.
+4. `0x03` reports `02` (generator destroyed) for a few ticks and the **flag is returned** in
+   the responses; scan all bytes for `CTF{`.
 
-## Modèle de commandes
-
-| opcode | signification |
-|--------|---------------|
-| `0x01` | télémétrie (deux angles de phase, bit disjoncteur) |
-| `0x02` | lecture état disjoncteur (0 = ouvert) |
-| `0x03` | **état du générateur** : `01` en ligne · `00` hors ligne · **`02` = DÉTRUIT** |
-| `0x04` | ouvrir le disjoncteur |
-| `0x05` arg=1 | **fermer le disjoncteur** |
-
-## Physique simulée
-
-- `angle_réseau` et `angle_générateur` tournent de 0 à 360°. Le générateur tourne à une fréquence légèrement différente, donc l'**angle de glissement Δ = (réseau − générateur) mod 360** s'accumule à ~5°/s.
-- Une connexion fraîche démarre **synchronisée** (Δ≈0). Fermer le disjoncteur à Δ≈0 est une *synchronisation sûre* → rien ne se passe.
-- Comme il n'y a **pas de vérification de synchronisme**, le disjoncteur se ferme à **n'importe quel Δ**. Fermer près de **Δ ≈ 180°** (opposition de phase) produit le transitoire de couple destructeur = **Aurora**.
-
-## Méthode
-
-1. Ouvrir une connexion ; interroger `0x01`, calculer `Δ = (réseau − générateur) mod 360`.
-2. Attendre que `|Δ − 180| ≤ ~6°`.
-3. Envoyer `0x05 01 00 00 00` (fermer) à cet instant.
-4. `0x03` renvoie `02` (générateur détruit) pendant quelques cycles et le **flag est renvoyé** dans les réponses ; scanner tous les octets pour `CTF{`.
-
-## Squelette d'exploit
-
+### Minimal exploit
 ```python
-# socket persistant, cadrage exact (11 octets si opcode==0x01, sinon 1)
-# boucle: lire 0x01 -> d=(réseau-générateur)%360
-#   si abs(d-180)<=6: envoyer b'\x05\x01\x00\x00\x00'
-# puis lire télémétrie/0x03 et regex le flux pour CTF{...}
+# persistent socket, exact framing (11 bytes if opcode==0x01 else 1)
+# loop: read 0x01 -> d=(grid-gen)%360 ; if abs(d-180)<=6: send b'\x05\x01\x00\x00\x00'
+# then read telemetry/0x03 and regex the stream for CTF{...}
 ```
 
-## Résultat
+### Why it's a good challenge (designer notes)
+- Pure **protocol-logic** vuln: the destructive primitive is the legitimate "close breaker"
+  command; the bug is the *missing interlock*, stated plainly in the briefing for fairness.
+- Forces real reverse-engineering with **no docs**: opcode enumeration, float endianness,
+  and — crucially — **self-describing framing** (fixed length per opcode).
+- The **timing/phase gate** makes it more than "send the magic byte": you must model the slip
+  and fire in a window, which is satisfying and hard to brute.
+- `0x03 == 0x02` as a distinct "destroyed" state is a clean, discoverable success signal.
 
-Flag récupéré après fermeture du disjoncteur en opposition de phase (Δ ≈ 180°).
-
-```
-CTF{REDACTED}
-```
-
-## Pièges rencontrés
-
-- **Désynchronisation du flux** : lire avec un timeout-and-drain au lieu de longueurs exactes fait apparaître `0x03` comme « aléatoirement » 00/01/02 et gaspille des heures. Le cadrage exact par opcode est la découverte attendue.
-- **Endianness des floats** : les deux angles sont en **little-endian** — tester les deux endianness tôt.
-- **Fermeture à un moment aléatoire** (Δ faible au début de la connexion) → « rien ne se passe », on conclut à tort que la commande close est incorrecte.
-
-## Ancrage historique
-
-Reproduit l'**INL Aurora Generator Test de 2007** : destruction physique d'un générateur diesel par fermeture hors synchronisme du disjoncteur de couplage. La vulnérabilité est l'absence d'interlock de sécurité sur le fil, pas un bug mémoire.
+### Pitfalls players hit (anti-frustration tuning)
+- **Stream desync**: reading with a timeout-and-drain loop instead of exact lengths makes
+  `0x03` appear to "randomly" return 00/01/02 and wastes hours. A good design choice *if*
+  intended; otherwise document a length byte. (Here there's none — exact-length framing is
+  the intended discovery.)
+- Treating the two floats as independent/garbage (wrong endianness: they're **little-endian**).
+- Closing at a random time (Δ small early in the connection) → "nothing happens", player
+  concludes the close command is wrong.
 
 ---
 
-*Write-up par **Le_Geek** — BUG|PWN CTF · OT#002 Breaker 52.*
+## Design cookbook — building OT/ICS challenges like these

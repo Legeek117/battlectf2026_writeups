@@ -1,28 +1,8 @@
 # 0byte
 
-- **Catégorie :** out context
-- **Flag :** `CTF{REDACTED}` (format `battleCTF{....}`)
-- **Fichiers fournis :** aucun
+**Auteur :** Le_Geek
 
-## Contexte
-
-La description indique uniquement le format du flag : `battleCTF{....}`. Pas de fichier, pas
-de service, pas d'indice supplémentaire. Le nom « 0byte » suggère un défi de type trivia, meta
-ou « flag gratuit » (donné lors d'un événement, dans une annonce, ou dans les règles/FAQ du
-CTF).
-
-## Méthode
-
-Le flag a été trouvé dans les ressources publiques du CTF (site, annonces, règlement, page
-d'accueil ou briefing de la compétition). Ce type de challenge récompense l'attention portée
-aux communications de l'organisation.
-
-## Flag
-
-```
-CTF{REDACTED}
-```
-
----
-
-*Write-up par **Le_Geek** — BUG|PWN CTF · 0byte.*
+Le challenge ne fournit ni service ni fichier exploitable : l’indice est entièrement méta. En
+recoupant la page du CTF, le règlement et les annonces publiques, on retrouve le format demandé et
+le mot attendu dans les ressources de l’événement. Le flag est donc construit à partir de cet indice,
+sans exploitation technique.

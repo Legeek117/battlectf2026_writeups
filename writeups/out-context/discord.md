@@ -1,27 +1,7 @@
 # Discord
 
-- **Catégorie :** out context
-- **Flag :** `CTF{REDACTED}`
-- **Fichiers fournis :** aucun
+**Auteur :** Le_Geek
 
-## Contexte
-
-Pas de description — le titre dit tout. Le flag se trouve quelque part sur le serveur Discord
-officiel du CTF.
-
-## Méthode
-
-Rejoindre le serveur Discord du CTF (lien fourni sur la page d'accueil ou dans les règles).
-Parcourir les salons, messages épinglés, descriptions de salons, rôles, bots ou annonces
-pour trouver le flag. Ce type de challenge vise à s'assurer que les participants rejoignent
-le canal de communication officiel.
-
-## Flag
-
-```
-CTF{REDACTED}
-```
-
----
-
-*Write-up par **Le_Geek** — BUG|PWN CTF · Discord.*
+Le flag se trouve dans le serveur Discord officiel, dans le canal associé aux annonces du qualifier.
+La résolution consiste à rejoindre le serveur, parcourir les messages épinglés et relever la valeur
+au format `CTF{...}`. Aucun décodage ou exploit n’est nécessaire.

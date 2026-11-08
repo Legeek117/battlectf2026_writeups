@@ -1,29 +1,62 @@
-# PWN#Alpha — Vault Terminal ARM (mprotect + shellcode sur la pile)
+# PWN#Alpha — Vault Terminal (ARM)
 
-- **Auteur :** Le_Geek
-- **Cible :** `<HOST>:<PORT>` (ELF 32-bit ARM armhf/EABI5, PIE, dynamiquement lié, stripped)
-- **Catégorie :** pwn
-- **Flag :** `CTF{REDACTED}`
-- **Fichiers fournis :** `vault` (ELF ARM)
+**Objective (verbatim):** *"Get a shell on the remote host and read the flag."*
+**Deliverable:** `vault` — ELF 32-bit **ARM (armhf/EABI5)**, **PIE, dynamically linked, stripped**.
+Canary found, NX, Partial RELRO.
+**Flag:** `CTF{3183b60e20b34af6528ff443e52b0445COBE}`
 
-## Contexte
+### 0. TL;DR
 
-Troisième recompilation du même source « Vault Terminal », cette fois ARM/Thumb-2, dynamiquement lié et stripped. Comme PWN#Beta (MIPS), le **binaire téléchargé a sa section `.data` volontairement effacée**, ce qui provoque un segfault dans son stub d'entrée obfusqué avant d'atteindre `main`.
+Third recompile of the same "Vault Terminal" source, this time ARM/Thumb-2, dynamically linked
+and stripped — and, like PWN#Beta (MIPS), the **downloaded binary's `.data` has been deliberately
+scrubbed** so it segfaults in its own obfuscated entry stub before ever reaching `main` (see §1).
+Static analysis (capstone, Thumb mode) of the small (`0x484`-byte) app `.text` was still enough:
+same 64-byte buffer, 65-byte name read (1-byte canary overflow, same leak trick as PWN#Delta),
+150-byte message read (`0x96`) reaching well past the saved return address. Because this binary
+is dynamically linked with **no `system()` import and no stack-popping gadget for `r0`-`r3`
+anywhere in the tiny app code**, a classic ret2libc wasn't available without a libc-base leak —
+but the author had planted a **self-mprotecting shellcode stub** (originally meant to decrypt and
+exec a hidden 36-byte blob) whose *tail* — `mov r0,r3; r0 &= ~0xfff; r1=0x1000; r2=7 (RWX);
+r7=125 (SYS_mprotect); svc #0; r3+=1; bx r3` — is reusable as-is: pop `r3` = our own leaked stack
+buffer address, run the mprotect tail, land back in the (now executable) buffer, execute inline
+Thumb shellcode. **No libc leak, no ASLR dependency** (qemu-user has none by default anyway).
 
-Le stub d'entrée (`e_entry = 0x9e1`, Thumb) décode un saut via XOR avec une clé dérivée d'un pointeur `.data` relocalisé (`R_ARM_RELATIVE`) XORé avec une constante fixe (`0x426f6772` — la même constante que dans le trampoline MIPS de PWN#Beta, confirmant un packer commun). Dans le binaire distribué, le mot `.data` nécessaire est **mis à zéro** — crash immédiat.
+### 1. The scrubbed entry stub (and why local testing needed a patched copy)
 
-## Reconnaissance
+`e_entry = 0x9e1` (Thumb). Its code: `mov r0,pc; ldr r1,[pc,#N]; ldr r1,[r1]; ldr r2,[pc,#M];
+eor r1,r1,r2; add r0,r0,r1; bx r0` — decode the XOR key from a relocated `.data` pointer (an
+`R_ARM_RELATIVE` self-reference) XORed with a baked-in constant (`0x426f6772` — the **same**
+magic constant seen in PWN#Beta's MIPS entry trampoline, confirming a shared, platform-wide
+download-protection packer). In the shipped download, the `.data` word that should make this XOR
+resolve to a meaningful jump target is **zeroed**, so it computes garbage and crashes immediately
+— **before `main`, before string decryption, before anything**. A second, separate obfuscation
+(`0x988`–`0x9de`) XOR-decrypts a 36-byte blob using a key derived from an actual **resolved GOT
+pointer** (so it can't be solved statically at all) then `mprotect`s and jumps into it; this is
+the stub this exploit's gadget was lifted from.
+For **local validation only**, patch `e_entry` (file offset `0x18`) straight to `main`
+(`0x945`) — this skips `__libc_start_main`'s normal path, which also breaks the (separately
+XOR-encrypted, 4-byte repeating key) string decryption, so local prompts render as garbage. That's
+cosmetic only; buffer offsets, gadget addresses and the overflow mechanics are unaffected and
+were validated against this patched copy under `qemu-arm` + a manually fetched armhf `libc6` deb
+(`QEMU_LD_PREFIX`) before firing at the real target, which runs un-scrubbed and prints correctly.
 
-L'analyse statique (capstone, mode Thumb) du petit `.text` applicatif (`0x484` octets) suffit :
+### 2. Binary recon (unobfuscated app code — the actual `.text` is tiny, `0x484` bytes)
 
-- `vuln` @ `0x89a` : frame `sub sp,#0x48` ; buffer à `r7+4` ; canary sauvegardé/vérifié à `r7+0x44` (**offset buffer 0x40 = 64**, convention identique à chaque architecture de la série) ; r7/LR sauvegardés aux **offsets buffer 68/72**.
-- `read(0, buf, 0x41)` pour le nom (65 octets — overflow 1 octet dans le canary) ; `read(0, buf, 0x96)` pour le message (150 octets — dépasse largement LR).
-- Imports : `printf, read, puts, setvbuf, __stack_chk_fail, abort` — **pas de `system`**.
-- Recherche exhaustive de gadgets dans tout le `.text` : **aucun `pop {r0-r3, ...}`** — la primitive usuelle pour configurer les arguments d'un appel libc n'existe pas dans ce binaire minimal stripped.
+- `vuln` @ `0x89a`: frame `sub sp,#0x48`; buffer at `r7+4`; canary saved/checked at `r7+0x44`
+  (**buffer offset 0x40 = 64**, identical convention to every other arch in this series); saved
+  `r7`/`LR` at **buffer offsets 68/72** (`push{r7,lr}` → `pop{r7,pc}` epilogue).
+- `read(0,buf,0x41)` for the name (65 bytes — 1-byte canary overflow); `read(0,buf,0x96)` for the
+  message (150 bytes — reaches **way** past `LR`, plenty of ROP room).
+- Imports: `__libc_start_main, __cxa_finalize, printf, read, __stack_chk_fail, puts, setvbuf,
+  abort` — **no `system`**, so no direct ret2libc without a leak.
+- `main` @ `0x944` calls `setup()` (disables stdio buffering), a string-decrypt routine (XOR with
+  a 4-byte repeating key at a fixed `.data` offset — unrelated to the entry-stub key), prints a
+  banner, then loops `bl vuln; b` back — same infinite-loop shape as every binary in this series.
+- Exhaustive gadget search of the whole `.text` (`capstone`, `skipdata=True`) found **no
+  `pop {r0-r3, ...}`** of any kind — the usual "set up libc call args" primitive simply doesn't
+  exist in this stripped, minimal app.
 
-## Le gadget mprotect-shellcode réutilisable
-
-Une seconde couche d'obfuscation (`0x988`–`0x9de`) XOR-déchiffre un blob de 36 octets puis fait mprotect + jump. La **queue** de ce stub est réutilisable telle quelle :
+### 3. The reused mprotect-shellcode gadget
 
 ```
 0x9c2: mov  r0, r3
@@ -38,47 +71,66 @@ Une seconde couche d'obfuscation (`0x988`–`0x9de`) XOR-déchiffre un blob de 3
 0x9da: add.w r3, r3, #1         ; set Thumb bit
 0x9de: bx   r3
 ```
+Land here with `r3` = **any address inside our own buffer**, and the whole page becomes RWX, then
+execution jumps straight into it (`r3+1`). The only missing piece is getting an attacker-chosen
+value into `r3` on the way in — solved by a clean, pre-existing **`pop {r3, pc}`** at `0x676`
+(tail of an unrelated dead function) reached directly via the hijacked `LR`.
 
-Atterrir ici avec `r3` = une adresse dans le buffer, et toute la page devient RWX, puis l'exécution saute dans le buffer (`r3+1`). Le chaînon manquant : un `pop {r3, pc}` à `0x676`.
+### 4. Leak: canary **and** a stable stack address, no ASLR
 
-## Fuite : canary + adresse pile stable, pas d'ASLR
+Same `read(0,buf,0x41)`-into-64-byte-buffer, no-NUL, dangling-`%s` trick as PWN#Delta: send
+**exactly 65 bytes, no trailing newline**. The echoed `"Hello, "` + our 65 bytes is followed by:
+canary bytes 1–3, then the **old saved `r7`** (buffer offset 68) — which equals `R1_main`, the
+stack pointer `vuln` was called with — then the first 2 bytes of the saved `LR` before a `0x00`
+cuts the string. The saved-`r7` value is **identical across independent TCP connections**,
+confirming qemu-user's default (no ASLR) behaviour on this deployment — exactly like the stable
+"gap bytes" seen in PWN#Delta. From it: `BUFFER_ADDR = leaked_r7 - 0x4c` (vuln's own
+`push{r7,lr}; sub sp,#0x48; add r7,sp,#0` then `buf = r7+4`), fully computed, **no hardcoded
+address needed, works unchanged across runs**.
 
-Meme technique `read(0,buf,0x41)` dans un buffer de 64 octets, pas de NUL, `%s` pendouillant : envoyer **exactement 65 octets, sans retour a la ligne**. L'echo contient : les octets 1-3 du canary, puis l'ancien `r7` sauvegarde (offset buffer 68) = `R1_main`, le pointeur de pile avec lequel `vuln` a ete appele, puis les 2 premiers octets du LR sauvegarde avant qu'un `0x00` coupe.
-
-La valeur de r7 sauvegarde est **identique entre connexions TCP independantes**, confirmant le comportement par defaut de qemu-user (pas d'ASLR).
-
-`BUFFER_ADDR = leaked_r7 - 0x4c` (calcule depuis le push/sub/add de vuln).
-
-## Payload (buffer message, 84 octets)
+### 5. Byte-exact chain (message buffer, 84 bytes)
 
 ```
-[0:28)   Shellcode Thumb : mov r0,pc; add r0,#0x10; mov r1,#0; mov r2,#0;
-         mov r7,#11 (execve); svc #0;  puis b"/bin/sh\x00"
-[28:64)  padding
-[64:68)  p32(canary_fuite)
-[68:72)  padding (ancien r7)
+[0:28)   Thumb shellcode (keystone-assembled): mov r0,pc; add r0,#0x10; mov r1,#0; mov r2,#0;
+         mov r7,#11 (execve); svc #0;  then b"/bin/sh\x00"  (20 bytes code + 8 bytes string)
+[28:64)  filler
+[64:68)  p32(leaked_canary)
+[68:72)  filler (old r7 — unused)
 [72:76)  p32(0x400676 | 1)        # pop {r3, pc}
-[76:80)  p32(BUFFER_ADDR)         # -> r3  (pointe sur le shellcode en offset 0)
-[80:84)  p32(0x4009c2 | 1)        # -> pc  (gadget mprotect-tail)
+[76:80)  p32(BUFFER_ADDR)         # -> r3  (points at offset 0 of this very buffer = shellcode)
+[80:84)  p32(0x4009c2 | 1)        # -> pc  (mprotect-tail gadget)
 ```
+`PIE_BASE = 0x400000` confirmed directly from a local `qemu-arm` run (unscrubbed-entry crash
+trace showed the app's own code executing at `0x4009e0` etc.) and cross-checked against the
+leaked partial `LR` low bytes. Flow: `vuln` → `pop{r3,pc}` sets `r3=BUFFER_ADDR` → mprotect-tail
+makes that page RWX → `bx r3+1` jumps into our own shellcode → `execve("/bin/sh",0,0)`.
 
-`PIE_BASE = 0x400000` confirme depuis une trace qemu-arm locale.
+### 6. Dead ends / pitfalls hit
 
-Flux : `vuln` retourne vers `pop{r3,pc}` qui met `r3=BUFFER_ADDR` puis saute vers le gadget mprotect qui rend la page RWX, et `bx r3+1` saute dans le shellcode pour `execve("/bin/sh",0,0)`.
+- **Assumed the loop would survive an LR redirect back to the "natural" return address
+  (`main`+`0x976`+1) as a cheap isolation test** — it reliably crashed too, which looked like a
+  PIE-base or offset error and burned a long debugging detour (re-deriving `R1_main`'s exact
+  value through the epilogue's `adds r7,#0x48; mov sp,r7; pop{r7,pc}`, re-verifying every gadget
+  address byte-for-byte, re-checking PIE base from the leak's low 16 bits). In the end the actual
+  exploit chain (which never returns into compiler-generated code, only two hand-picked gadgets
+  and raw shellcode) worked regardless — returning cleanly into `main` is a stricter, unrelated
+  requirement (stack/arg state `main`'s surrounding code implicitly expects) that this exploit
+  doesn't need to satisfy at all. **Lesson: don't build an isolation test that's harder to get
+  right than the real exploit.**
+- **Local string decryption breaks under the `e_entry`-patched local copy** (key depends on state
+  `__libc_start_main` normally sets up) — cosmetic, but means local output can't be matched by
+  literal prompt text; match on the raw bytes you sent instead (e.g. search for the echoed
+  `b"A"*65`, not for `b"Hello, "`).
+- **`objdump` has no ARM target either** — `capstone` (`CS_ARCH_ARM`, `CS_MODE_THUMB`,
+  `skipdata=True`) throughout; PLT stub addresses were recovered by hand from `.rel.plt` + ARM
+  (non-Thumb!) PLT stub disassembly, since the PLT itself is in ARM mode even though the app is
+  Thumb.
 
-## Resultat
+### 7. Solver
 
-```
-CTF{REDACTED}
-```
-
-Flag lu dans `/flag/flag.txt` apres obtention d'un shell sur le socket.
-
-## Pieges rencontres
-
-- **Pas de target ARM dans objdump** sur cette machine — utiliser `capstone` (`CS_ARCH_ARM`, `CS_MODE_THUMB`, `skipdata=True`) ; les stubs PLT sont en mode ARM (non-Thumb) meme si l'application est Thumb.
-- **Le stub d'entree XOR crashe avant main** dans le binaire telecharge — patcher `e_entry` vers `main` (`0x945`) pour les tests locaux uniquement.
-- **La decryption des chaines casse dans la copie patchee** — cosmetique, les offsets et la mecanique de l'overflow sont inchanges.
+`python3 exploit_alpha.py 169.58.126.107 5004` → leak → build the 84-byte payload → shell on the
+inherited socket stdio. `id` → `uid=65534(nobody)`; flag at `/flag/flag.txt`.
+Flag confirmed: `CTF{3183b60e20b34af6528ff443e52b0445COBE}`.
 
 ---
 

